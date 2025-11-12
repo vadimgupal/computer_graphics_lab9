@@ -3,16 +3,9 @@ from math import cos, sin, radians
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from dataclasses import dataclass
+from PIL import Image, ImageTk
 
-# Pillow для пиксельного буфера
-try:
-    from PIL import Image, ImageTk
-except ImportError:
-    raise SystemExit("Требуется Pillow: pip install pillow")
 
-# ==========================
-# Математика / утилиты
-# ==========================
 def normalize(v):
     v = np.asarray(v, float)
     n = np.linalg.norm(v)
@@ -36,9 +29,7 @@ def Rz(a):
     a=radians(a); ca,sa=cos(a),sin(a)
     M=np.eye(4); M[0,0],M[0,1],M[1,0],M[1,1]=ca,-sa,sa,ca; return M
 
-# ==========================
-# Геометрия
-# ==========================
+
 @dataclass
 class Face:
     idx: tuple    # индексы вершин (треугольник)
@@ -55,6 +46,12 @@ class Mesh:
         self.VN = VN.copy() if VN is not None else None
 
         for tri in F:
+            # если нам уже дали Face с uv — просто принять
+            if isinstance(tri, Face):
+                self.F.append(tri)
+                continue
+
+            # ниже — старое поведение (на случай простых мешей)
             if len(tri) == 3:
                 i0,i1,i2 = tri
                 self.F.append(Face((i0,i1,i2),
@@ -75,10 +72,24 @@ class Mesh:
         self.compute_vertex_normals_if_missing()
 
     def compute_face_normals(self):
+
         self.face_normals = []
+
+        # центр модели в текущих координатах
+        mesh_center = np.mean(self.V, axis=0)
+
         for f in self.F:
             p0, p1, p2 = self.V[list(f.idx)]
-            n = normalize(np.cross(p1-p0, p2-p0))
+            n = normalize(np.cross(p1 - p0, p2 - p0))  # исходная нормаль (зависит от порядка вершин)
+
+            # центр текущей грани
+            face_center = (p0 + p1 + p2) / 3.0
+            outward = face_center - mesh_center
+
+            # если нормаль смотрит внутрь — переворачиваем
+            if np.dot(n, outward) < 0.0:
+                n = -n
+
             f.normal = n
             self.face_normals.append(n)
 
@@ -103,9 +114,6 @@ class Mesh:
         self.compute_face_normals()
         return self
 
-# ==========================
-# Встроенные модели + UV
-# ==========================
 def tetrahedron_mesh():
     V = np.array([
         (1,1,1),
@@ -164,7 +172,7 @@ def octahedron_mesh():
 # ==========================
 def load_obj(path):
     vs, vts, vns = [], [], []
-    faces = []
+    faces_raw = []
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
             if not line.strip() or line.startswith('#'): continue
@@ -176,48 +184,44 @@ def load_obj(path):
             elif t[0]=='vn':
                 vns.append(list(map(float, t[1:4])))
             elif t[0]=='f':
-                idx_triplets=[]
+                trip = []
                 for part in t[1:]:
                     parts = part.split('/')
                     vi = int(parts[0]) - 1
                     ti = int(parts[1]) - 1 if len(parts)>1 and parts[1] else None
                     ni = int(parts[2]) - 1 if len(parts)>2 and parts[2] else None
-                    idx_triplets.append((vi,ti,ni))
-                for k in range(1, len(idx_triplets)-1):
-                    faces.append([ idx_triplets[0], idx_triplets[k], idx_triplets[k+1] ])
+                    trip.append((vi, ti, ni))
+                # триангуляция полигона
+                for k in range(1, len(trip)-1):
+                    faces_raw.append([ trip[0], trip[k], trip[k+1] ])
+
     V = np.array(vs, float) if vs else np.zeros((0,3), float)
 
-    has_uv = len(vts)>0
-    has_vn = len(vns)>0
-    UV = np.zeros((len(V),2), float)
-    VN = np.zeros((len(V),3), float) if has_vn else None
+    faces = []
+    for tri in faces_raw:
+        idx = tuple(vi for (vi,ti,ni) in tri)
+        uv  = tuple( (tuple(vts[ti]) if (ti is not None and 0 <= ti < len(vts)) else (0.0,0.0))
+                     for (vi,ti,ni) in tri )
+        faces.append(Face(idx=idx, uv=uv))
 
-    F = []
-    for tri in faces:
-        F.append(tuple(vi for (vi,ti,ni) in tri))
-        if has_uv:
-            for (vi,ti,_) in tri:
-                if ti is not None and 0<=ti<len(vts):
-                    UV[vi] = vts[ti]
-        if has_vn:
-            for (vi,_,ni) in tri:
-                if ni is not None and 0<=ni<len(vns):
-                    VN[vi] = vns[ni]
-    return Mesh(V, F, UV=UV, VN=VN)
+    # нормали можно не тянуть из файла — вы их уже усредняете
+    return Mesh(V, faces, UV=None, VN=None)
 
-# ==========================
-# Растеризация / освещение
-# ==========================
+
 def edge_function(ax, ay, bx, by, cx, cy):
     return (cx - ax)*(by - ay) - (cy - ay)*(bx - ax)
 
 def shade_lambert(diff_color, n, l_dir):
+    #скалярное произведение нормали и направления света
     ndotl = max(0.0, float(np.dot(n, l_dir)))
+    #умножаем переданный цвет на скалярное произведение
     c = np.clip(np.array(diff_color)*ndotl, 0, 1)
+
     return (c*255.0).astype(np.uint8)
 
 def shade_toon(diff_color, n, l_dir, levels=4):
     ndotl = max(0.0, float(np.dot(n, l_dir)))
+    
     q = int(ndotl * levels) / max(1, levels-1)
     c = np.clip(np.array(diff_color)*q, 0, 1)
     return (c*255.0).astype(np.uint8)
@@ -229,14 +233,11 @@ def sample_texture(img_np, u, v):
     x = int(uu); y = int(vv)
     return img_np[y, x]
 
-# ==========================
-# Рендер-пайплайн
-# ==========================
 class Renderer:
     def __init__(self, width, height):
         self.w, self.h = width, height
         self.bg = (245,245,245)
-        self.light_pos = np.array([3,3,5], float)
+        self.light_pos = np.array([0,0,-50], float)
         self.object_color = np.array([0.9, 0.4, 0.2], float)
         self.use_texture = False
         self.texture = None
@@ -244,6 +245,7 @@ class Renderer:
         self.perspective = True
         self.cull_backfaces = True
         self.fov = 60.0
+        self.ortho_view = np.array([0.0, 0.0, 1.0], float)
 
     def set_texture_from_path(self, path):
         img = Image.open(path).convert('RGB')
@@ -268,75 +270,110 @@ class Renderer:
         sy = (-y * self.h*0.5) + self.h*0.5
         return np.c_[sx, sy], Vw[:,2]
 
-    def render(self, mesh: Mesh, rot=(0,0,0), trans=(0,0,0), scale=(1,1,1)):
-        M = T(*trans) @ Rz(rot[2]) @ Ry(rot[1]) @ Rx(rot[0]) @ S(*scale)
-        mesh = Mesh(mesh.V.copy(), [f.idx for f in mesh.F], UV=mesh.UV.copy(), VN=mesh.VN.copy())
-        mesh.apply(M)
+    def render(self, mesh: Mesh, model_matrix=None):
+        work = Mesh(mesh.V.copy(), [f.idx for f in mesh.F], UV=mesh.UV.copy(), VN=mesh.VN.copy())
+        if model_matrix is not None:
+            work.apply(model_matrix)
 
         img, zbuf = self.clear()
         pix = img.load()
 
-        screen, zview = self.project(mesh.V)
-        Lvec = self.light_pos[None, :] - mesh.V
-        Ldir_per_vertex = Lvec / np.linalg.norm(Lvec, axis=1, keepdims=True)
+        screen, zview = self.project(work.V)  # work.V уже в world после model_matrix
 
-        for f in mesh.F:
-            i0,i1,i2 = f.idx
-            v0,v1,v2 = mesh.V[[i0,i1,i2]]
+        # направление от вершины к источнику
+        Lvec = self.light_pos[None, :] - work.V
+        eps = 1e-8
+        Lnorm = np.linalg.norm(Lvec, axis=1, keepdims=True)
+        Lnorm[Lnorm < eps] = eps
+        Ldir_per_vertex = Lvec / Lnorm  # нормализованные направления света
+
+        #растеризация треугольников
+        for f in work.F:
+            i0, i1, i2 = f.idx
+            v0, v1, v2 = work.V[[i0, i1, i2]]
+
+            # отсечение
             if self.cull_backfaces:
                 n = f.normal
                 center = (v0 + v1 + v2) / 3.0
-                center_shifted = np.array([center[0], center[1], center[2] + 5.0], float)
-                view_to_face = normalize(center_shifted)
-                if np.dot(n, view_to_face) > 0:
+                if self.perspective:
+                    center_shifted = np.array([center[0], center[1], center[2] + 5.0], float)
+                    view_to_face = normalize(center_shifted)  # вектор к центру грани
+                else:
+                    view_to_face = normalize(self.ortho_view)
+                # лицевая грань, если нормаль смотрит К камере -> скаляр < 0
+                if np.dot(n, view_to_face) >= 0.0:
                     continue
 
-            x0,y0 = screen[i0]; x1,y1 = screen[i1]; x2,y2 = screen[i2]
-            z0,z1,z2 = zview[i0], zview[i1], zview[i2]
-            minx = int(max(0,   np.floor(min(x0,x1,x2))))
-            maxx = int(min(self.w-1, np.ceil(max(x0,x1,x2))))
-            miny = int(max(0,   np.floor(min(y0,y1,y2))))
-            maxy = int(min(self.h-1, np.ceil(max(y0,y1,y2))))
-            area = edge_function(x0,y0, x1,y1, x2,y2)
+            #экранные координаты
+            x0, y0 = screen[i0]
+            x1, y1 = screen[i1]
+            x2, y2 = screen[i2]
+            z0, z1, z2 = zview[i0], zview[i1], zview[i2]
+
+            # bbox
+            minx = int(max(0, np.floor(min(x0, x1, x2))))
+            maxx = int(min(self.w - 1, np.ceil(max(x0, x1, x2))))
+            miny = int(max(0, np.floor(min(y0, y1, y2))))
+            maxy = int(min(self.h - 1, np.ceil(max(y0, y1, y2))))
+
+            area = edge_function(x0, y0, x1, y1, x2, y2)
             if area == 0:
                 continue
 
-            n0, n1, n2 = mesh.VN[[i0,i1,i2]]
-            l0, l1, l2 = Ldir_per_vertex[[i0,i1,i2]]
-            uv0,uv1,uv2 = np.array(f.uv[0]), np.array(f.uv[1]), np.array(f.uv[2])
+            # атрибуты вершин
+            n0, n1, n2 = work.VN[[i0, i1, i2]]
+            l0, l1, l2 = Ldir_per_vertex[[i0, i1, i2]]
+            uv0, uv1, uv2 = np.array(f.uv[0]), np.array(f.uv[1]), np.array(f.uv[2])
 
+            #предсчитать цвета по Ламберту
             if self.shading == 'gouraud':
                 c0 = shade_lambert(self.object_color, n0, l0)
                 c1 = shade_lambert(self.object_color, n1, l1)
                 c2 = shade_lambert(self.object_color, n2, l2)
 
-            for y in range(miny, maxy+1):
-                for x in range(minx, maxx+1):
-                    w0 = edge_function(x1,y1, x2,y2, x,y)
-                    w1 = edge_function(x2,y2, x0,y0, x,y)
-                    w2 = edge_function(x0,y0, x1,y1, x,y)
-                    if (w0>=0 and w1>=0 and w2>=0) or (w0<=0 and w1<=0 and w2<=0):
-                        w0 /= area; w1 /= area; w2 /= area
-                        z = w0*z0 + w1*z1 + w2*z2
-                        if z < zbuf[y,x]:
-                            zbuf[y,x] = z
-                            if self.shading == 'gouraud':
-                                col = (w0*c0 + w1*c1 + w2*c2).astype(np.uint8)
-                                if self.use_texture and self.texture is not None:
-                                    uv = w0*uv0 + w1*uv1 + w2*uv2
-                                    tex = sample_texture(self.texture, uv[0], uv[1]).astype(np.uint8)
-                                    col = (col.astype(int)*tex.astype(int)//255).astype(np.uint8)
-                                pix[x,y] = tuple(map(int, col))
-                            else:
-                                n = normalize(w0*n0 + w1*n1 + w2*n2)
-                                l = normalize(w0*l0 + w1*l1 + w2*l2)
-                                col = shade_toon(self.object_color, n, l, levels=4)
-                                if self.use_texture and self.texture is not None:
-                                    uv = w0*uv0 + w1*uv1 + w2*uv2
-                                    tex = sample_texture(self.texture, uv[0], uv[1]).astype(np.uint8)
-                                    col = (col.astype(int)*tex.astype(int)//255).astype(np.uint8)
-                                pix[x,y] = tuple(map(int, col))
+            invz0 = 1.0 / max(1e-8, z0)
+            invz1 = 1.0 / max(1e-8, z1)
+            invz2 = 1.0 / max(1e-8, z2)
+
+            # заполнение
+            for y in range(miny, maxy + 1):
+                for x in range(minx, maxx + 1):
+                    w0 = edge_function(x1, y1, x2, y2, x, y)
+                    w1 = edge_function(x2, y2, x0, y0, x, y)
+                    w2 = edge_function(x0, y0, x1, y1, x, y)
+                    if (w0 >= 0 and w1 >= 0 and w2 >= 0) or (w0 <= 0 and w1 <= 0 and w2 <= 0):
+                        w0 /= area
+                        w1 /= area
+                        w2 /= area
+
+                        # z-buffer
+                        z = w0 * z0 + w1 * z1 + w2 * z2
+                        if z >= zbuf[y, x]:
+                            continue
+                        zbuf[y, x] = z
+
+                        if self.shading == 'gouraud':
+                            col = (w0 * c0 + w1 * c1 + w2 * c2).astype(np.uint8)
+                        else:
+                            # phong + toon: интерполяция нормали и света
+                            n = normalize(w0 * n0 + w1 * n1 + w2 * n2)
+                            l = normalize(w0 * l0 + w1 * l1 + w2 * l2)
+                            col = shade_toon(self.object_color, n, l, levels=4)
+
+                        # текстура
+                        if self.use_texture and self.texture is not None:
+                            den = w0 * invz0 + w1 * invz1 + w2 * invz2
+                            u = (w0 * uv0[0] * invz0 + w1 * uv1[0] * invz1 + w2 * uv2[0] * invz2) / den
+                            v = (w0 * uv0[1] * invz0 + w1 * uv1[1] * invz1 + w2 * uv2[1] * invz2) / den
+                            uv = np.array([u, v], float)
+                            tex = sample_texture(self.texture, float(uv[0]), float(uv[1])).astype(np.uint8)
+                            col = (col.astype(int) * tex.astype(int) // 255).astype(np.uint8)
+
+                        pix[x, y] = tuple(map(int, col))
+
         return img
+
 
 # ==========================
 # GUI
@@ -393,7 +430,7 @@ class App:
 
         ttk.Label(ctrl, text="Масштаб:").pack(side=tk.LEFT, padx=(12,2))
         self.s = tk.DoubleVar(value=1.0); ttk.Entry(ctrl, textvariable=self.s, width=6).pack(side=tk.LEFT, padx=2)
-
+        ttk.Button(ctrl, text="Применить трансформацию", command=self.apply_transform).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(ctrl, text="Обновить", command=self.redraw).pack(side=tk.RIGHT)
 
         # === Панель 3: Свет и цвет ===
@@ -421,6 +458,28 @@ class App:
         self.tk_img = None
 
         self.canvas.bind("<Configure>", self.on_resize)
+        self.redraw()
+
+    def apply_transform(self):
+        # собираем матрицу из текущих полей
+        rx, ry, rz = float(self.rx.get()), float(self.ry.get()), float(self.rz.get())
+        tx, ty, tz = float(self.tx.get()), float(self.ty.get()), float(self.tz.get())
+        s = float(self.s.get())
+        M = T(tx, ty, tz) @ Rz(rz) @ Ry(ry) @ Rx(rx) @ S(s, s, s)
+
+        # ЗАПЕКАЕМ в сам меш (инкрементально)
+        self.mesh.apply(M)
+
+        # Сбрасываем поля, чтобы следующий «Применить» был новым инкрементом
+        self.rx.set(0.0);
+        self.ry.set(0.0);
+        self.rz.set(0.0)
+        self.tx.set(0.0);
+        self.ty.set(0.0);
+        self.tz.set(0.0)
+        self.s.set(1.0)
+
+        # Перерисовка
         self.redraw()
 
     def set_model(self):
@@ -474,14 +533,16 @@ class App:
         self.renderer.perspective = self.persp_var.get()
         self.renderer.cull_backfaces = self.cull_var.get()
 
-        rot = (float(self.rx.get()), float(self.ry.get()), float(self.rz.get()))
-        trans = (float(self.tx.get()), float(self.ty.get()), float(self.tz.get()))
-        sc = (float(self.s.get()), float(self.s.get()), float(self.s.get()))
+        # текущая матрица ТОЛЬКО для предпросмотра (не мутируем меш)
+        rx, ry, rz = float(self.rx.get()), float(self.ry.get()), float(self.rz.get())
+        tx, ty, tz = float(self.tx.get()), float(self.ty.get()), float(self.tz.get())
+        s = float(self.s.get())
+        M_preview = T(tx, ty, tz) @ Rz(rz) @ Ry(ry) @ Rx(rx) @ S(s, s, s)
 
-        img = self.renderer.render(self.mesh, rot=rot, trans=trans, scale=sc)
+        img = self.renderer.render(self.mesh, model_matrix=M_preview)
         self.tk_img = ImageTk.PhotoImage(img)
         self.canvas.delete('all')
-        self.canvas.create_image(0,0, anchor='nw', image=self.tk_img)
+        self.canvas.create_image(0, 0, anchor='nw', image=self.tk_img)
 
 def main():
     root = tk.Tk()
