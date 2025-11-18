@@ -480,14 +480,14 @@ class PolygonFace:
             self.normal = np.array([0.0, 0.0, 1.0])
             return
 
-        # Проверяем, что нормаль направлена наружу от центра объекта
+        # Для выпуклых многогранников проверяем направление нормали относительно центра
         if object_center is not None:
             # Центр грани
             face_center = np.mean(vertices[:, self.indices], axis=1)
             # Вектор от центра объекта к центру грани
             outward = face_center - object_center
 
-            # Если нормаль направлена внутрь (скалярное произведение < 0), переворачиваем её
+            # Если нормаль направлена внутрь (угол > 90 градусов), переворачиваем её
             if np.dot(normal, outward) < 0:
                 normal = -normal
 
@@ -541,8 +541,8 @@ class Polyhedron:
         vertex_face_count = [0 for _ in range(vertices_3d.shape[1])]
 
         for face in self.faces:
-            for vertex_idx in face.indices:
-                if face.normal is not None:
+            if face.normal is not None:
+                for vertex_idx in face.indices:
                     vertex_normals[vertex_idx] += face.normal
                     vertex_face_count[vertex_idx] += 1
 
@@ -550,6 +550,8 @@ class Polyhedron:
         for i in range(len(vertex_normals)):
             if vertex_face_count[i] > 0:
                 vertex_normals[i] = normalize(vertex_normals[i])
+            else:
+                vertex_normals[i] = np.array([0.0, 0.0, 1.0])
 
         # Сохраняем нормали вершин в гранях
         for face in self.faces:
@@ -841,6 +843,45 @@ def dodecahedron():
 
 
 # --------------------
+# Класс ZBuffer
+# --------------------
+
+class ZBuffer:
+    """Класс для реализации z-буфера."""
+
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.buffer = np.full((height, width), np.inf, dtype=float)
+        self.color_buffer = np.zeros((height, width, 3), dtype=float)
+
+    def clear(self):
+        """Очищает z-буфер."""
+        self.buffer.fill(np.inf)
+        self.color_buffer.fill(0.0)
+
+    def test_and_set(self, x, y, z, color):
+        """Проверяет и устанавливает пиксель в z-буфере."""
+        if 0 <= x < self.width and 0 <= y < self.height:
+            if z < self.buffer[y, x]:
+                self.buffer[y, x] = z
+                self.color_buffer[y, x] = color
+                return True
+        return False
+
+    def draw_to_canvas(self, canvas):
+        """Отрисовывает z-буфер на canvas."""
+        for y in range(self.height):
+            for x in range(self.width):
+                if self.buffer[y, x] < np.inf:
+                    color = self.color_buffer[y, x]
+                    r = int(color[0] * 255)
+                    g = int(color[1] * 255)
+                    b = int(color[2] * 255)
+                    hex_color = f'#{r:02x}{g:02x}{b:02x}'
+                    canvas.create_line(x, y, x + 1, y, fill=hex_color)
+
+# --------------------
 # Классы для освещения и материалов
 # --------------------
 
@@ -960,6 +1001,15 @@ def load_texture_from_file(filename):
     """Загружает текстуру из файла."""
     try:
         image = Image.open(filename)
+        # Конвертируем в RGB если нужно (убираем альфа-канал)
+        if image.mode in ('RGBA', 'LA'):
+            # Создаем белый фон для прозрачных текстур
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            background.paste(image, mask=image.split()[-1])  # Используем альфа-канал как маску
+            image = background
+        elif image.mode != 'RGB':
+            image = image.convert('RGB')
+
         return np.array(image)
     except Exception as e:
         print(f"Ошибка загрузки текстуры: {e}")
@@ -990,31 +1040,33 @@ def get_texture_color(texture, u, v):
     y = max(0, min(height - 1, y))
 
     # Получаем цвет и нормализуем
-    color = texture[y, x] / 255.0
-    return color
+    color = texture[y, x]
+
+    # Если текстура имеет 4 канала (RGBA), берем только RGB
+    if len(color) >= 3:
+        color = color[:3]  # Берем только первые 3 канала
+
+    return color / 255.0
 
 
 # --------------------
 # Функции для растеризации
 # --------------------
 
-def rasterize_triangle_gouraud(canvas, vertices_2d, vertex_colors, fill_color=None):
-    """Растеризует треугольник с интерполяцией цвета по Гуро."""
+def rasterize_triangle_gouraud_zbuffer(zbuffer, vertices_2d, vertices_3d, vertex_colors):
+    """Растеризует треугольник с интерполяцией цвета по Гуро и z-буфером."""
     if len(vertices_2d) != 3 or len(vertex_colors) != 3:
         return
 
-    # Получаем координаты вершин
-    x0, y0 = vertices_2d[0]
-    x1, y1 = vertices_2d[1]
-    x2, y2 = vertices_2d[2]
+    x0, y0, z0 = vertices_2d[0][0], vertices_2d[0][1], vertices_3d[0][2]
+    x1, y1, z1 = vertices_2d[1][0], vertices_2d[1][1], vertices_3d[1][2]
+    x2, y2, z2 = vertices_2d[2][0], vertices_2d[2][1], vertices_3d[2][2]
 
-    # Находим ограничивающий прямоугольник
     min_x = max(0, int(min(x0, x1, x2)))
-    max_x = min(canvas.winfo_width(), int(max(x0, x1, x2)) + 1)
+    max_x = min(zbuffer.width, int(max(x0, x1, x2)) + 1)
     min_y = max(0, int(min(y0, y1, y2)))
-    max_y = min(canvas.winfo_height(), int(max(y0, y1, y2)) + 1)
+    max_y = min(zbuffer.height, int(max(y0, y1, y2)) + 1)
 
-    # Функции для вычисления барицентрических координат
     def compute_weights(x, y):
         denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
         if abs(denom) < 1e-10:
@@ -1026,7 +1078,6 @@ def rasterize_triangle_gouraud(canvas, vertices_2d, vertex_colors, fill_color=No
 
         return w0, w1, w2
 
-    # Растеризация
     for y in range(min_y, max_y):
         for x in range(min_x, max_x):
             weights = compute_weights(x, y)
@@ -1035,38 +1086,31 @@ def rasterize_triangle_gouraud(canvas, vertices_2d, vertex_colors, fill_color=No
 
             w0, w1, w2 = weights
 
-            # Проверяем, находится ли точка внутри треугольника
             if w0 >= 0 and w1 >= 0 and w2 >= 0:
+                # Интерполируем z-координату
+                z = w0 * z0 + w1 * z1 + w2 * z2
+
                 # Интерполируем цвет
                 color = interpolate_color(vertex_colors, [w0, w1, w2])
 
-                # Преобразуем цвет в hex
-                r = int(color[0] * 255)
-                g = int(color[1] * 255)
-                b = int(color[2] * 255)
-                hex_color = f'#{r:02x}{g:02x}{b:02x}'
-
-                # Рисуем пиксель
-                canvas.create_line(x, y, x + 1, y, fill=hex_color)
+                # Тестируем и устанавливаем в z-буфер
+                zbuffer.test_and_set(x, y, z, color)
 
 
-def rasterize_triangle_phong(canvas, vertices_2d, vertex_normals, view_dir, light, material, fill_color=None):
-    """Растеризует треугольник с интерполяцией нормалей по Фонгу."""
+def rasterize_triangle_phong_zbuffer(zbuffer, vertices_2d, vertices_3d, vertex_normals, view_dir, light, material):
+    """Растеризует треугольник с интерполяцией нормалей по Фонгу и z-буфером."""
     if len(vertices_2d) != 3 or len(vertex_normals) != 3:
         return
 
-    # Получаем координаты вершин
-    x0, y0 = vertices_2d[0]
-    x1, y1 = vertices_2d[1]
-    x2, y2 = vertices_2d[2]
+    x0, y0, z0 = vertices_2d[0][0], vertices_2d[0][1], vertices_3d[0][2]
+    x1, y1, z1 = vertices_2d[1][0], vertices_2d[1][1], vertices_3d[1][2]
+    x2, y2, z2 = vertices_2d[2][0], vertices_2d[2][1], vertices_3d[2][2]
 
-    # Находим ограничивающий прямоугольник
     min_x = max(0, int(min(x0, x1, x2)))
-    max_x = min(canvas.winfo_width(), int(max(x0, x1, x2)) + 1)
+    max_x = min(zbuffer.width, int(max(x0, x1, x2)) + 1)
     min_y = max(0, int(min(y0, y1, y2)))
-    max_y = min(canvas.winfo_height(), int(max(y0, y1, y2)) + 1)
+    max_y = min(zbuffer.height, int(max(y0, y1, y2)) + 1)
 
-    # Функции для вычисления барицентрических координат
     def compute_weights(x, y):
         denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
         if abs(denom) < 1e-10:
@@ -1078,7 +1122,6 @@ def rasterize_triangle_phong(canvas, vertices_2d, vertex_normals, view_dir, ligh
 
         return w0, w1, w2
 
-    # Растеризация
     for y in range(min_y, max_y):
         for x in range(min_x, max_x):
             weights = compute_weights(x, y)
@@ -1087,42 +1130,41 @@ def rasterize_triangle_phong(canvas, vertices_2d, vertex_normals, view_dir, ligh
 
             w0, w1, w2 = weights
 
-            # Проверяем, находится ли точка внутри треугольника
             if w0 >= 0 and w1 >= 0 and w2 >= 0:
+                # Интерполируем z-координату
+                z = w0 * z0 + w1 * z1 + w2 * z2
+
                 # Интерполируем нормаль
                 normal = interpolate_normal(vertex_normals, [w0, w1, w2])
 
                 # Вычисляем освещение по Фонгу
-                light_dir = normalize(light.position - np.array([x, y, 0]))  # Упрощенное направление к свету
+                # Используем интерполированную позицию для направления к свету
+                pos_x = w0 * vertices_3d[0][0] + w1 * vertices_3d[1][0] + w2 * vertices_3d[2][0]
+                pos_y = w0 * vertices_3d[0][1] + w1 * vertices_3d[1][1] + w2 * vertices_3d[2][1]
+                pos_z = z
+                pos_3d = np.array([pos_x, pos_y, pos_z])
+
+                light_dir = normalize(light.position - pos_3d)
                 color = phong_shading(normal, view_dir, light_dir, material, light)
 
-                # Преобразуем цвет в hex
-                r = int(color[0] * 255)
-                g = int(color[1] * 255)
-                b = int(color[2] * 255)
-                hex_color = f'#{r:02x}{g:02x}{b:02x}'
-
-                # Рисуем пиксель
-                canvas.create_line(x, y, x + 1, y, fill=hex_color)
+                # Тестируем и устанавливаем в z-буфер
+                zbuffer.test_and_set(x, y, z, color)
 
 
-def rasterize_triangle_textured(canvas, vertices_2d, tex_coords, texture, fill_color=None):
-    """Растеризует треугольник с наложением текстуры."""
+def rasterize_triangle_textured_zbuffer(zbuffer, vertices_2d, vertices_3d, tex_coords, texture):
+    """Растеризует треугольник с наложением текстуры и z-буфером."""
     if len(vertices_2d) != 3 or len(tex_coords) != 3:
         return
 
-    # Получаем координаты вершин
-    x0, y0 = vertices_2d[0]
-    x1, y1 = vertices_2d[1]
-    x2, y2 = vertices_2d[2]
+    x0, y0, z0 = vertices_2d[0][0], vertices_2d[0][1], vertices_3d[0][2]
+    x1, y1, z1 = vertices_2d[1][0], vertices_2d[1][1], vertices_3d[1][2]
+    x2, y2, z2 = vertices_2d[2][0], vertices_2d[2][1], vertices_3d[2][2]
 
-    # Находим ограничивающий прямоугольник
     min_x = max(0, int(min(x0, x1, x2)))
-    max_x = min(canvas.winfo_width(), int(max(x0, x1, x2)) + 1)
+    max_x = min(zbuffer.width, int(max(x0, x1, x2)) + 1)
     min_y = max(0, int(min(y0, y1, y2)))
-    max_y = min(canvas.winfo_height(), int(max(y0, y1, y2)) + 1)
+    max_y = min(zbuffer.height, int(max(y0, y1, y2)) + 1)
 
-    # Функции для вычисления барицентрических координат
     def compute_weights(x, y):
         denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
         if abs(denom) < 1e-10:
@@ -1134,7 +1176,6 @@ def rasterize_triangle_textured(canvas, vertices_2d, tex_coords, texture, fill_c
 
         return w0, w1, w2
 
-    # Растеризация
     for y in range(min_y, max_y):
         for x in range(min_x, max_x):
             weights = compute_weights(x, y)
@@ -1143,8 +1184,10 @@ def rasterize_triangle_textured(canvas, vertices_2d, tex_coords, texture, fill_c
 
             w0, w1, w2 = weights
 
-            # Проверяем, находится ли точка внутри треугольника
             if w0 >= 0 and w1 >= 0 and w2 >= 0:
+                # Интерполируем z-координату
+                z = w0 * z0 + w1 * z1 + w2 * z2
+
                 # Интерполируем текстурные координаты
                 tex_coord = interpolate_tex_coord(tex_coords, [w0, w1, w2])
                 u, v = tex_coord
@@ -1152,14 +1195,8 @@ def rasterize_triangle_textured(canvas, vertices_2d, tex_coords, texture, fill_c
                 # Получаем цвет из текстуры
                 color = get_texture_color(texture, u, v)
 
-                # Преобразуем цвет в hex
-                r = int(color[0] * 255)
-                g = int(color[1] * 255)
-                b = int(color[2] * 255)
-                hex_color = f'#{r:02x}{g:02x}{b:02x}'
-
-                # Рисуем пиксель
-                canvas.create_line(x, y, x + 1, y, fill=hex_color)
+                # Тестируем и устанавливаем в z-буфер
+                zbuffer.test_and_set(x, y, z, color)
 
 
 # --------------------
@@ -1183,67 +1220,23 @@ def make_poly(name: str) -> Polyhedron:
     return builder()
 
 
-def project_points(P: Polyhedron, proj_mode: str, f: float = 1.8, view_vector=None, cull_backfaces=False,
-                   camera=None):
-    """Возвращает 2D проекцию вершин и список рёбер.
-
-    proj_mode: 'perspective' или 'axonometric'/'isometric' или 'camera'
-    camera: объект Camera для режима 'camera'
-    view_vector: вектор направления обзора (3D) - направление ОТ камеры К объекту
-    cull_backfaces: если True, отсекаем нелицевые грани
-    """
+def project_points(P: Polyhedron, proj_mode: str, f: float = 1.8, view_vector=None, cull_backfaces=False, camera=None):
+    """Возвращает 2D проекцию вершин и 3D координаты после преобразований."""
     Q = P.copy()
 
-    # Применяем трансформации перед проверкой видимости
+    # Применяем трансформации
     if proj_mode == 'camera' and camera is not None:
-        # Используем матрицу вида камеры
         view_matrix = camera.get_view_matrix()
         Q = Q.apply(view_matrix)
-        # Вектор обзора в системе координат камеры
-        if cull_backfaces:
-            view_vector = np.array([0.0, 0.0, -1.0])  # Камера смотрит вдоль -Z в своей системе координат
     elif proj_mode == 'perspective':
-        # Стандартная перспектива: сместим модель на z=5
         Q = Q.translate(0, 0, 5.0)
     else:
-        # Для изометрической проекции применяем повороты
         alpha = 35.264389682754654
         beta = 45.0
         Q = Q.apply(Rx(alpha) @ Rz(beta))
 
-    # Определяем видимые грани ПОСЛЕ применения трансформаций
-    visible_faces = []
-    if cull_backfaces:
-        if view_vector is None:
-            view_vector = np.array([0.0, 0.0, 1.0])
-
-        view_vector = np.asarray(view_vector, dtype=float)
-        view_vector = normalize(view_vector)
-
-        # Получаем 3D координаты вершин после трансформаций
-        vertices_3d = Q.V[:3, :] / Q.V[3, :]
-
-        for face in Q.faces:
-            if face.normal is not None:
-                # Берем центр грани
-                face_center = np.mean(vertices_3d[:, face.indices], axis=1)
-
-                # Определяем вектор от камеры к грани
-                if proj_mode in ['perspective', 'camera']:
-                    # Камера в (0,0,0), смотрит вдоль +Z (или -Z в системе камеры)
-                    # Вектор от камеры к грани
-                    view_to_face = normalize(face_center)
-                else:
-                    # Для ортографической проекции используем заданный вектор обзора
-                    view_to_face = normalize(view_vector)
-
-                # Скалярное произведение нормали (направлена наружу) и направления взгляда
-                dot_product = np.dot(face.normal, view_to_face)
-
-                if dot_product < 0:  # Грань лицевая
-                    visible_faces.append(face)
-    else:
-        visible_faces = Q.faces
+    # Получаем 3D координаты после преобразований (до проекции)
+    vertices_3d = Q.V[:3, :] / Q.V[3, :]
 
     # Теперь применяем проекцию
     if proj_mode == 'camera' and camera is not None:
@@ -1251,25 +1244,15 @@ def project_points(P: Polyhedron, proj_mode: str, f: float = 1.8, view_vector=No
     elif proj_mode == 'perspective':
         M = perspective(f)
     else:
-        # Только ортографическая проекция (повороты уже применены)
         M = ortho_xy()
 
     x, y = Q.projected(M)
 
-    # Строим рёбра только из видимых граней
-    if cull_backfaces:
-        es = set()
-        for f in visible_faces:
-            idx = f.indices
-            for i in range(len(idx)):
-                a = idx[i]
-                b = idx[(i + 1) % len(idx)]
-                es.add(tuple(sorted((a, b))))
-        edges = sorted(list(es))
-    else:
-        edges = Q.edges()
+    # Все грани считаем видимыми - z-буфер сам разберется
+    visible_faces = Q.faces
+    edges = Q.edges()
 
-    return (x, y, edges, visible_faces, Q)
+    return (x, y, edges, visible_faces, Q, vertices_3d)
 
 
 def to_pixels(x, y, width, height, scale=120.0):
@@ -1301,7 +1284,7 @@ class App:
 
         # Вектор обзора (направление ОТ камеры К объекту, по умолчанию смотрим вдоль +Z)
         self.view_vector = np.array([0.0, 0.0, 1.0])
-        self.cull_backfaces = tk.BooleanVar(value=False)
+        # self.cull_backfaces = tk.BooleanVar(value=False)
 
         # Камера
         self.camera = Camera(position=[0, 2, 5], target=[0, 0, 0], up=[0, 1, 0])
@@ -1428,41 +1411,6 @@ class App:
         self.texture_combo.bind('<<ComboboxSelected>>', lambda e: self.change_texture())
 
         ttk.Button(texture_row, text='Загрузить текстуру', command=self.load_texture).pack(side=tk.LEFT, padx=6)
-
-        # Остальные элементы интерфейса (камера, преобразования и т.д.) остаются без изменений
-
-        # Панель настроек отсечения нелицевых граней
-        cull_frame = ttk.LabelFrame(self.root, text='Отсечение нелицевых граней')
-        cull_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
-
-        cull_row1 = ttk.Frame(cull_frame)
-        cull_row1.pack(side=tk.TOP, fill=tk.X, pady=4)
-
-        self.cull_checkbox = ttk.Checkbutton(
-            cull_row1,
-            text='Включить отсечение нелицевых граней',
-            variable=self.cull_backfaces,
-            command=self.redraw
-        )
-        self.cull_checkbox.pack(side=tk.LEFT, padx=6)
-
-        cull_row2 = ttk.Frame(cull_frame)
-        cull_row2.pack(side=tk.TOP, fill=tk.X, pady=4)
-
-        ttk.Label(cull_row2, text='Вектор обзора (x, y, z):').pack(side=tk.LEFT, padx=(6, 4))
-        self.view_x_entry = ttk.Entry(cull_row2, width=6)
-        self.view_x_entry.insert(0, '0')
-        self.view_x_entry.pack(side=tk.LEFT, padx=2)
-
-        self.view_y_entry = ttk.Entry(cull_row2, width=6)
-        self.view_y_entry.insert(0, '0')
-        self.view_y_entry.pack(side=tk.LEFT, padx=2)
-
-        self.view_z_entry = ttk.Entry(cull_row2, width=6)
-        self.view_z_entry.insert(0, '1')
-        self.view_z_entry.pack(side=tk.LEFT, padx=2)
-
-        ttk.Button(cull_row2, text='Применить', command=self.apply_view_vector).pack(side=tk.LEFT, padx=6)
 
         # Панель управления камерой
         camera_frame = ttk.LabelFrame(self.root, text='Управление камерой')
@@ -1881,37 +1829,40 @@ class App:
 
         P = self.get_poly()
         mode = self.proj_var.get()
-        cull = self.cull_backfaces.get()
         render_mode = self.render_mode.get()
 
         # Обновляем aspect ratio камеры
         if W > 0 and H > 0:
             self.camera.aspect = W / H
 
-        x, y, edges, visible_faces, transformed_poly = project_points(
-            P, mode, view_vector=self.view_vector, cull_backfaces=cull, camera=self.camera
+        # Получаем проекцию и 3D координаты
+        x, y, edges, visible_faces, transformed_poly, vertices_3d = project_points(
+            P, mode, camera=self.camera
         )
 
-        # Фиксированный небольшой размер фигур
+        # Преобразуем в пиксели
         Xs, Ys = to_pixels(x, y, W, H, scale=120.0)
 
         if render_mode == 'wireframe':
-            # Рисуем рёбра
+            # Для каркасного режима рисуем как раньше
             for a, b in edges:
                 self.canvas.create_line(float(Xs[a]), float(Ys[a]), float(Xs[b]), float(Ys[b]), fill='#1f77b4')
         else:
-            # Рисуем закрашенные грани
-            vertices_3d = transformed_poly.V[:3, :] / transformed_poly.V[3, :]
+            # Создаем z-буфер
+            zbuffer = ZBuffer(W, H)
+            zbuffer.clear()
 
+            # Рендерим все грани через z-буфер
             for face in visible_faces:
                 if len(face.indices) < 3:
                     continue
 
-                # Получаем 2D координаты вершин грани
+                # Подготавливаем данные для грани
                 face_vertices_2d = [(float(Xs[i]), float(Ys[i])) for i in face.indices]
+                face_vertices_3d = [vertices_3d[:, i] for i in face.indices]
 
                 if render_mode == 'gouraud':
-                    # Вычисляем цвета вершин по модели Ламберта
+                    # Вычисляем цвета вершин
                     vertex_colors = []
                     for i, vertex_idx in enumerate(face.indices):
                         vertex_pos = vertices_3d[:, vertex_idx]
@@ -1925,100 +1876,72 @@ class App:
                         vertex_color = lambert_shading(vertex_normal, light_dir, self.material, self.light)
                         vertex_colors.append(vertex_color)
 
-                    # Растеризуем треугольник с шейдингом Гуро
+                    # Растеризуем треугольники
                     if len(face.indices) == 3:
-                        rasterize_triangle_gouraud(self.canvas, face_vertices_2d, vertex_colors)
+                        rasterize_triangle_gouraud_zbuffer(zbuffer, face_vertices_2d, face_vertices_3d, vertex_colors)
                     elif len(face.indices) == 4:
                         # Разбиваем четырехугольник на два треугольника
-                        tri1_vertices = [face_vertices_2d[0], face_vertices_2d[1], face_vertices_2d[2]]
+                        tri1_2d = [face_vertices_2d[0], face_vertices_2d[1], face_vertices_2d[2]]
+                        tri1_3d = [face_vertices_3d[0], face_vertices_3d[1], face_vertices_3d[2]]
                         tri1_colors = [vertex_colors[0], vertex_colors[1], vertex_colors[2]]
-                        rasterize_triangle_gouraud(self.canvas, tri1_vertices, tri1_colors)
+                        rasterize_triangle_gouraud_zbuffer(zbuffer, tri1_2d, tri1_3d, tri1_colors)
 
-                        tri2_vertices = [face_vertices_2d[0], face_vertices_2d[2], face_vertices_2d[3]]
+                        tri2_2d = [face_vertices_2d[0], face_vertices_2d[2], face_vertices_2d[3]]
+                        tri2_3d = [face_vertices_3d[0], face_vertices_3d[2], face_vertices_3d[3]]
                         tri2_colors = [vertex_colors[0], vertex_colors[2], vertex_colors[3]]
-                        rasterize_triangle_gouraud(self.canvas, tri2_vertices, tri2_colors)
+                        rasterize_triangle_gouraud_zbuffer(zbuffer, tri2_2d, tri2_3d, tri2_colors)
 
                 elif render_mode == 'phong':
-                    # Растеризуем с шейдингом Фонга
                     view_dir = np.array([0, 0, 1])  # Упрощенное направление взгляда
+                    vertex_normals = face.vertex_normals if face.vertex_normals else [face.normal] * len(face.indices)
 
                     if len(face.indices) == 3:
-                        vertex_normals = face.vertex_normals if face.vertex_normals else [face.normal] * 3
-                        rasterize_triangle_phong(
-                            self.canvas, face_vertices_2d, vertex_normals, view_dir,
-                            self.light, self.material
-                        )
+                        rasterize_triangle_phong_zbuffer(zbuffer, face_vertices_2d, face_vertices_3d, vertex_normals,
+                                                         view_dir, self.light, self.material)
                     elif len(face.indices) == 4:
-                        # Разбиваем четырехугольник на два треугольника
-                        vertex_normals = face.vertex_normals if face.vertex_normals else [face.normal] * 4
-
-                        tri1_vertices = [face_vertices_2d[0], face_vertices_2d[1], face_vertices_2d[2]]
+                        tri1_2d = [face_vertices_2d[0], face_vertices_2d[1], face_vertices_2d[2]]
+                        tri1_3d = [face_vertices_3d[0], face_vertices_3d[1], face_vertices_3d[2]]
                         tri1_normals = [vertex_normals[0], vertex_normals[1], vertex_normals[2]]
-                        rasterize_triangle_phong(
-                            self.canvas, tri1_vertices, tri1_normals, view_dir,
-                            self.light, self.material
-                        )
+                        rasterize_triangle_phong_zbuffer(zbuffer, tri1_2d, tri1_3d, tri1_normals, view_dir, self.light,
+                                                         self.material)
 
-                        tri2_vertices = [face_vertices_2d[0], face_vertices_2d[2], face_vertices_2d[3]]
+                        tri2_2d = [face_vertices_2d[0], face_vertices_2d[2], face_vertices_2d[3]]
+                        tri2_3d = [face_vertices_3d[0], face_vertices_3d[2], face_vertices_3d[3]]
                         tri2_normals = [vertex_normals[0], vertex_normals[2], vertex_normals[3]]
-                        rasterize_triangle_phong(
-                            self.canvas, tri2_vertices, tri2_normals, view_dir,
-                            self.light, self.material
-                        )
-
-
+                        rasterize_triangle_phong_zbuffer(zbuffer, tri2_2d, tri2_3d, tri2_normals, view_dir, self.light,
+                                                         self.material)
 
                 elif render_mode == 'texture':
-
-                    # Текстурирование
-
                     texture = self.textures.get(self.current_texture)
 
-                    # Генерируем простые текстурные координаты если их нет
-
+                    # Генерируем текстурные координаты если их нет
                     if not hasattr(face, 'tex_coords') or not face.tex_coords:
-
-                        # Простая проекция текстурных координат
-
                         tex_coords = []
-
                         for i, vertex_idx in enumerate(face.indices):
                             vertex_pos = vertices_3d[:, vertex_idx]
-
-                            # Простая проекция на плоскость XY
-
                             u = float((vertex_pos[0] + 1) / 2)
-
                             v = float((vertex_pos[1] + 1) / 2)
-
                             tex_coords.append([u, v])
-
                     else:
-
-                        # Преобразуем в numpy arrays для гарантии
-
                         tex_coords = [np.array(self.model.tex_coords[tc_idx], dtype=float) for tc_idx in
                                       face.tex_coords]
 
                     if len(face.indices) == 3:
-
-                        rasterize_triangle_textured(self.canvas, face_vertices_2d, tex_coords, texture)
-
+                        rasterize_triangle_textured_zbuffer(zbuffer, face_vertices_2d, face_vertices_3d, tex_coords,
+                                                            texture)
                     elif len(face.indices) == 4:
-
-                        # Разбиваем четырехугольник на два треугольника
-
-                        tri1_vertices = [face_vertices_2d[0], face_vertices_2d[1], face_vertices_2d[2]]
-
+                        tri1_2d = [face_vertices_2d[0], face_vertices_2d[1], face_vertices_2d[2]]
+                        tri1_3d = [face_vertices_3d[0], face_vertices_3d[1], face_vertices_3d[2]]
                         tri1_tex_coords = [tex_coords[0], tex_coords[1], tex_coords[2]]
+                        rasterize_triangle_textured_zbuffer(zbuffer, tri1_2d, tri1_3d, tri1_tex_coords, texture)
 
-                        rasterize_triangle_textured(self.canvas, tri1_vertices, tri1_tex_coords, texture)
-
-                        tri2_vertices = [face_vertices_2d[0], face_vertices_2d[2], face_vertices_2d[3]]
-
+                        tri2_2d = [face_vertices_2d[0], face_vertices_2d[2], face_vertices_2d[3]]
+                        tri2_3d = [face_vertices_3d[0], face_vertices_3d[2], face_vertices_3d[3]]
                         tri2_tex_coords = [tex_coords[0], tex_coords[2], tex_coords[3]]
+                        rasterize_triangle_textured_zbuffer(zbuffer, tri2_2d, tri2_3d, tri2_tex_coords, texture)
 
-                        rasterize_triangle_textured(self.canvas, tri2_vertices, tri2_tex_coords, texture)
+            # Отрисовываем z-буфер на canvas
+            zbuffer.draw_to_canvas(self.canvas)
 
     def load_obj(self):
         """Загрузка модели из OBJ файла"""
